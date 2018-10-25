@@ -3,13 +3,43 @@ package inbound
 import (
 	"context"
 
+	"v2ray.com/core"
 	"v2ray.com/core/app/proxyman"
-	"v2ray.com/core/app/proxyman/mux"
 	"v2ray.com/core/common"
 	"v2ray.com/core/common/dice"
+	"v2ray.com/core/common/mux"
 	"v2ray.com/core/common/net"
+	"v2ray.com/core/common/serial"
+	"v2ray.com/core/features/policy"
+	"v2ray.com/core/features/stats"
 	"v2ray.com/core/proxy"
+	"v2ray.com/core/transport/internet"
 )
+
+func getStatCounter(v *core.Instance, tag string) (stats.Counter, stats.Counter) {
+	var uplinkCounter stats.Counter
+	var downlinkCounter stats.Counter
+
+	policy := v.GetFeature(policy.ManagerType()).(policy.Manager)
+	if len(tag) > 0 && policy.ForSystem().Stats.InboundUplink {
+		statsManager := v.GetFeature(stats.ManagerType()).(stats.Manager)
+		name := "inbound>>>" + tag + ">>>traffic>>>uplink"
+		c, _ := stats.GetOrRegisterCounter(statsManager, name)
+		if c != nil {
+			uplinkCounter = c
+		}
+	}
+	if len(tag) > 0 && policy.ForSystem().Stats.InboundDownlink {
+		statsManager := v.GetFeature(stats.ManagerType()).(stats.Manager)
+		name := "inbound>>>" + tag + ">>>traffic>>>downlink"
+		c, _ := stats.GetOrRegisterCounter(statsManager, name)
+		if c != nil {
+			downlinkCounter = c
+		}
+	}
+
+	return uplinkCounter, downlinkCounter
+}
 
 type AlwaysOnInboundHandler struct {
 	proxy   proxy.Inbound
@@ -34,36 +64,59 @@ func NewAlwaysOnInboundHandler(ctx context.Context, tag string, receiverConfig *
 		tag:   tag,
 	}
 
+	uplinkCounter, downlinkCounter := getStatCounter(core.MustFromContext(ctx), tag)
+
 	nl := p.Network()
 	pr := receiverConfig.PortRange
 	address := receiverConfig.Listen.AsAddress()
 	if address == nil {
 		address = net.AnyIP
 	}
+
+	mss, err := internet.ToMemoryStreamConfig(receiverConfig.StreamSettings)
+	if err != nil {
+		return nil, newError("failed to parse stream config").Base(err).AtWarning()
+	}
+
+	if receiverConfig.ReceiveOriginalDestination {
+		if mss.SocketSettings == nil {
+			mss.SocketSettings = &internet.SocketConfig{}
+		}
+		if mss.SocketSettings.Tproxy == internet.SocketConfig_Off {
+			mss.SocketSettings.Tproxy = internet.SocketConfig_Redirect
+		}
+		mss.SocketSettings.ReceiveOriginalDestAddress = true
+	}
+
 	for port := pr.From; port <= pr.To; port++ {
 		if nl.HasNetwork(net.Network_TCP) {
 			newError("creating stream worker on ", address, ":", port).AtDebug().WriteToLog()
+
 			worker := &tcpWorker{
-				address:      address,
-				port:         net.Port(port),
-				proxy:        p,
-				stream:       receiverConfig.StreamSettings,
-				recvOrigDest: receiverConfig.ReceiveOriginalDestination,
-				tag:          tag,
-				dispatcher:   h.mux,
-				sniffers:     receiverConfig.DomainOverride,
+				address:         address,
+				port:            net.Port(port),
+				proxy:           p,
+				stream:          mss,
+				recvOrigDest:    receiverConfig.ReceiveOriginalDestination,
+				tag:             tag,
+				dispatcher:      h.mux,
+				sniffingConfig:  receiverConfig.GetEffectiveSniffingSettings(),
+				uplinkCounter:   uplinkCounter,
+				downlinkCounter: downlinkCounter,
 			}
 			h.workers = append(h.workers, worker)
 		}
 
 		if nl.HasNetwork(net.Network_UDP) {
 			worker := &udpWorker{
-				tag:          tag,
-				proxy:        p,
-				address:      address,
-				port:         net.Port(port),
-				recvOrigDest: receiverConfig.ReceiveOriginalDestination,
-				dispatcher:   h.mux,
+				tag:             tag,
+				proxy:           p,
+				address:         address,
+				port:            net.Port(port),
+				dispatcher:      h.mux,
+				uplinkCounter:   uplinkCounter,
+				downlinkCounter: downlinkCounter,
+				stream:          mss,
 			}
 			h.workers = append(h.workers, worker)
 		}
@@ -72,6 +125,7 @@ func NewAlwaysOnInboundHandler(ctx context.Context, tag string, receiverConfig *
 	return h, nil
 }
 
+// Start implements common.Runnable.
 func (h *AlwaysOnInboundHandler) Start() error {
 	for _, worker := range h.workers {
 		if err := worker.Start(); err != nil {
@@ -81,11 +135,20 @@ func (h *AlwaysOnInboundHandler) Start() error {
 	return nil
 }
 
+// Close implements common.Closable.
 func (h *AlwaysOnInboundHandler) Close() error {
+	var errors []interface{}
 	for _, worker := range h.workers {
-		worker.Close()
+		if err := worker.Close(); err != nil {
+			errors = append(errors, err)
+		}
 	}
-	h.mux.Close()
+	if err := h.mux.Close(); err != nil {
+		errors = append(errors, err)
+	}
+	if len(errors) > 0 {
+		return newError("failed to close all resources").Base(newError(serial.Concat(errors...)))
+	}
 	return nil
 }
 

@@ -11,7 +11,7 @@ import (
 	"v2ray.com/core/common"
 )
 
-//go:generate go run $GOPATH/src/v2ray.com/core/common/errors/errorgen/main.go -pkg cert -path Protocol,TLS,Cert
+//go:generate errorgen
 
 type Certificate struct {
 	// Cerificate in ASN.1 DER format
@@ -75,6 +75,12 @@ func CommonName(name string) Option {
 func KeyUsage(usage x509.KeyUsage) Option {
 	return func(c *x509.Certificate) {
 		c.KeyUsage = usage
+	}
+}
+
+func Organization(org string) Option {
+	return func(c *x509.Certificate) {
+		c.Subject.Organization = []string{org}
 	}
 }
 

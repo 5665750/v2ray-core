@@ -3,8 +3,10 @@ package protocol
 import (
 	"io"
 
+	"v2ray.com/core/common"
 	"v2ray.com/core/common/buf"
 	"v2ray.com/core/common/net"
+	"v2ray.com/core/common/task"
 )
 
 type AddressOption func(*AddressParser)
@@ -30,6 +32,7 @@ func WithAddressTypeParser(atp AddressTypeParser) AddressOption {
 	}
 }
 
+// AddressParser is a utility for reading and writer addresses.
 type AddressParser struct {
 	addrTypeMap map[byte]net.AddressFamily
 	addrByteMap map[net.AddressFamily]byte
@@ -37,6 +40,7 @@ type AddressParser struct {
 	typeParser  AddressTypeParser
 }
 
+// NewAddressParser creates a new AddressParser
 func NewAddressParser(options ...AddressOption) *AddressParser {
 	p := &AddressParser{
 		addrTypeMap: make(map[byte]net.AddressFamily, 8),
@@ -105,7 +109,7 @@ func (p *AddressParser) readAddress(b *buf.Buffer, reader io.Reader) (net.Addres
 		domain := string(b.BytesFrom(-domainLength))
 		if maybeIPPrefix(domain[0]) {
 			addr := net.ParseAddress(domain)
-			if addr.Family().IsIPv4() || addrFamily.IsIPv6() {
+			if addr.Family().IsIPv4() || addr.Family().IsIPv6() {
 				return addr, nil
 			}
 		}
@@ -118,30 +122,42 @@ func (p *AddressParser) readAddress(b *buf.Buffer, reader io.Reader) (net.Addres
 	}
 }
 
+// ReadAddressPort reads address and port from the given input.
 func (p *AddressParser) ReadAddressPort(buffer *buf.Buffer, input io.Reader) (net.Address, net.Port, error) {
 	if buffer == nil {
 		buffer = buf.New()
 		defer buffer.Release()
 	}
 
+	var addr net.Address
+	var port net.Port
+
+	pTask := func() error {
+		lp, err := p.readPort(buffer, input)
+		if err != nil {
+			return err
+		}
+		port = lp
+		return nil
+	}
+
+	aTask := func() error {
+		a, err := p.readAddress(buffer, input)
+		if err != nil {
+			return err
+		}
+		addr = a
+		return nil
+	}
+
+	var err error
+
 	if p.portFirst {
-		port, err := p.readPort(buffer, input)
-		if err != nil {
-			return nil, 0, err
-		}
-		addr, err := p.readAddress(buffer, input)
-		if err != nil {
-			return nil, 0, err
-		}
-		return addr, port, nil
+		err = task.Run(task.Sequential(pTask, aTask))()
+	} else {
+		err = task.Run(task.Sequential(aTask, pTask))()
 	}
 
-	addr, err := p.readAddress(buffer, input)
-	if err != nil {
-		return nil, 0, err
-	}
-
-	port, err := p.readPort(buffer, input)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -150,8 +166,7 @@ func (p *AddressParser) ReadAddressPort(buffer *buf.Buffer, input io.Reader) (ne
 }
 
 func (p *AddressParser) writePort(writer io.Writer, port net.Port) error {
-	_, err := writer.Write(port.Bytes(nil))
-	return err
+	return common.Error2(writer.Write(port.Bytes(nil)))
 }
 
 func (p *AddressParser) writeAddress(writer io.Writer, address net.Address) error {
@@ -162,43 +177,38 @@ func (p *AddressParser) writeAddress(writer io.Writer, address net.Address) erro
 
 	switch address.Family() {
 	case net.AddressFamilyIPv4, net.AddressFamilyIPv6:
-		if _, err := writer.Write([]byte{tb}); err != nil {
-			return err
-		}
-		if _, err := writer.Write(address.IP()); err != nil {
-			return err
-		}
+		return task.Run(task.Sequential(func() error {
+			return common.Error2(writer.Write([]byte{tb}))
+		}, func() error {
+			return common.Error2(writer.Write(address.IP()))
+		}))()
 	case net.AddressFamilyDomain:
 		domain := address.Domain()
 		if isDomainTooLong(domain) {
 			return newError("Super long domain is not supported: ", domain)
 		}
-		if _, err := writer.Write([]byte{tb, byte(len(domain))}); err != nil {
-			return err
-		}
-		if _, err := writer.Write([]byte(domain)); err != nil {
-			return err
-		}
+		return task.Run(task.Sequential(func() error {
+			return common.Error2(writer.Write([]byte{tb, byte(len(domain))}))
+		}, func() error {
+			return common.Error2(writer.Write([]byte(domain)))
+		}))()
+	default:
+		panic("Unknown family type.")
 	}
-	return nil
 }
 
+// WriteAddressPort writes address and port into the given writer.
 func (p *AddressParser) WriteAddressPort(writer io.Writer, addr net.Address, port net.Port) error {
-	if p.portFirst {
-		if err := p.writePort(writer, port); err != nil {
-			return err
-		}
-		if err := p.writeAddress(writer, addr); err != nil {
-			return err
-		}
-		return nil
+	pTask := func() error {
+		return p.writePort(writer, port)
+	}
+	aTask := func() error {
+		return p.writeAddress(writer, addr)
 	}
 
-	if err := p.writeAddress(writer, addr); err != nil {
-		return err
+	if p.portFirst {
+		return task.Run(task.Sequential(pTask, aTask))()
 	}
-	if err := p.writePort(writer, port); err != nil {
-		return err
-	}
-	return nil
+
+	return task.Run(task.Sequential(aTask, pTask))()
 }

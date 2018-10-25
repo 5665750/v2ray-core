@@ -1,9 +1,11 @@
 package dispatcher
 
-//go:generate go run $GOPATH/src/v2ray.com/core/common/errors/errorgen/main.go -pkg impl -path App,Dispatcher,Default
+//go:generate errorgen
 
 import (
 	"context"
+	"strings"
+	"sync"
 	"time"
 
 	"v2ray.com/core"
@@ -12,36 +14,105 @@ import (
 	"v2ray.com/core/common/buf"
 	"v2ray.com/core/common/net"
 	"v2ray.com/core/common/protocol"
-	"v2ray.com/core/proxy"
-	"v2ray.com/core/transport/ray"
+	"v2ray.com/core/common/session"
+	"v2ray.com/core/common/vio"
+	"v2ray.com/core/features/outbound"
+	"v2ray.com/core/features/policy"
+	"v2ray.com/core/features/routing"
+	"v2ray.com/core/features/stats"
+	"v2ray.com/core/transport/pipe"
 )
 
 var (
 	errSniffingTimeout = newError("timeout on sniffing")
 )
 
-// DefaultDispatcher is a default implementation of Dispatcher.
-type DefaultDispatcher struct {
-	ohm    core.OutboundHandlerManager
-	router core.Router
-	policy core.PolicyManager
-	stats  core.StatManager
+type cachedReader struct {
+	sync.Mutex
+	reader *pipe.Reader
+	cache  buf.MultiBuffer
 }
 
-// NewDefaultDispatcher create a new DefaultDispatcher.
-func NewDefaultDispatcher(ctx context.Context, config *Config) (*DefaultDispatcher, error) {
-	v := core.MustFromContext(ctx)
-	d := &DefaultDispatcher{
-		ohm:    v.OutboundHandlerManager(),
-		router: v.Router(),
-		policy: v.PolicyManager(),
-		stats:  v.Stats(),
+func (r *cachedReader) Cache(b *buf.Buffer) {
+	mb, _ := r.reader.ReadMultiBufferTimeout(time.Millisecond * 100)
+	r.Lock()
+	if !mb.IsEmpty() {
+		common.Must(r.cache.WriteMultiBuffer(mb))
+	}
+	common.Must(b.Reset(func(x []byte) (int, error) {
+		return r.cache.Copy(x), nil
+	}))
+	r.Unlock()
+}
+
+func (r *cachedReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
+	r.Lock()
+	defer r.Unlock()
+
+	if r.cache != nil && !r.cache.IsEmpty() {
+		mb := r.cache
+		r.cache = nil
+		return mb, nil
 	}
 
-	if err := v.RegisterFeature((*core.Dispatcher)(nil), d); err != nil {
-		return nil, newError("unable to register Dispatcher")
+	return r.reader.ReadMultiBuffer()
+}
+
+func (r *cachedReader) ReadMultiBufferTimeout(timeout time.Duration) (buf.MultiBuffer, error) {
+	r.Lock()
+	defer r.Unlock()
+
+	if r.cache != nil && !r.cache.IsEmpty() {
+		mb := r.cache
+		r.cache = nil
+		return mb, nil
 	}
-	return d, nil
+
+	return r.reader.ReadMultiBufferTimeout(timeout)
+}
+
+func (r *cachedReader) CloseError() {
+	r.Lock()
+	if r.cache != nil {
+		r.cache.Release()
+		r.cache = nil
+	}
+	r.Unlock()
+	r.reader.CloseError()
+}
+
+// DefaultDispatcher is a default implementation of Dispatcher.
+type DefaultDispatcher struct {
+	ohm    outbound.Manager
+	router routing.Router
+	policy policy.Manager
+	stats  stats.Manager
+}
+
+func init() {
+	common.Must(common.RegisterConfig((*Config)(nil), func(ctx context.Context, config interface{}) (interface{}, error) {
+		d := new(DefaultDispatcher)
+		if err := core.RequireFeatures(ctx, func(om outbound.Manager, router routing.Router, pm policy.Manager, sm stats.Manager) error {
+			return d.Init(config.(*Config), om, router, pm, sm)
+		}); err != nil {
+			return nil, err
+		}
+		return d, nil
+	}))
+}
+
+// Init initializes DefaultDispatcher.
+func (d *DefaultDispatcher) Init(config *Config, om outbound.Manager, router routing.Router, pm policy.Manager, sm stats.Manager) error {
+	d.ohm = om
+	d.router = router
+	d.policy = pm
+	d.stats = sm
+	return nil
+}
+
+// Type implements common.HasType.
+func (*DefaultDispatcher) Type() interface{} {
+	return routing.DispatcherType()
 }
 
 // Start implements common.Runnable.
@@ -52,117 +123,140 @@ func (*DefaultDispatcher) Start() error {
 // Close implements common.Closable.
 func (*DefaultDispatcher) Close() error { return nil }
 
-func (d *DefaultDispatcher) getStatCounter(name string) core.StatCounter {
-	c := d.stats.GetCounter(name)
-	if c != nil {
-		return c
-	}
-	c, err := d.stats.RegisterCounter(name)
-	if err != nil {
-		return nil
-	}
-	return c
-}
+func (d *DefaultDispatcher) getLink(ctx context.Context) (*vio.Link, *vio.Link) {
+	opt := pipe.OptionsFromContext(ctx)
+	uplinkReader, uplinkWriter := pipe.New(opt...)
+	downlinkReader, downlinkWriter := pipe.New(opt...)
 
-func (d *DefaultDispatcher) getRayOption(user *protocol.User) []ray.Option {
-	var rayOptions []ray.Option
+	inboundLink := &vio.Link{
+		Reader: downlinkReader,
+		Writer: uplinkWriter,
+	}
+
+	outboundLink := &vio.Link{
+		Reader: uplinkReader,
+		Writer: downlinkWriter,
+	}
+
+	sessionInbound := session.InboundFromContext(ctx)
+	var user *protocol.MemoryUser
+	if sessionInbound != nil {
+		user = sessionInbound.User
+	}
 
 	if user != nil && len(user.Email) > 0 {
 		p := d.policy.ForLevel(user.Level)
 		if p.Stats.UserUplink {
 			name := "user>>>" + user.Email + ">>>traffic>>>uplink"
-			if c := d.getStatCounter(name); c != nil {
-				rayOptions = append(rayOptions, ray.WithUplinkStatCounter(c))
+			if c, _ := stats.GetOrRegisterCounter(d.stats, name); c != nil {
+				inboundLink.Writer = &vio.SizeStatWriter{
+					Counter: c,
+					Writer:  inboundLink.Writer,
+				}
 			}
 		}
 		if p.Stats.UserDownlink {
 			name := "user>>>" + user.Email + ">>>traffic>>>downlink"
-			if c := d.getStatCounter(name); c != nil {
-				rayOptions = append(rayOptions, ray.WithDownlinkStatCounter(c))
+			if c, _ := stats.GetOrRegisterCounter(d.stats, name); c != nil {
+				outboundLink.Writer = &vio.SizeStatWriter{
+					Counter: c,
+					Writer:  outboundLink.Writer,
+				}
 			}
 		}
 	}
 
-	return rayOptions
+	return inboundLink, outboundLink
 }
 
-// Dispatch implements core.Dispatcher.
-func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destination) (ray.InboundRay, error) {
+func shouldOverride(result SniffResult, domainOverride []string) bool {
+	for _, p := range domainOverride {
+		if strings.HasPrefix(result.Protocol(), p) {
+			return true
+		}
+	}
+	return false
+}
+
+// Dispatch implements routing.Dispatcher.
+func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destination) (*vio.Link, error) {
 	if !destination.IsValid() {
 		panic("Dispatcher: Invalid destination.")
 	}
-	ctx = proxy.ContextWithTarget(ctx, destination)
+	ob := &session.Outbound{
+		Target: destination,
+	}
+	ctx = session.ContextWithOutbound(ctx, ob)
 
-	user := protocol.UserFromContext(ctx)
-	rayOptions := d.getRayOption(user)
-
-	outbound := ray.New(ctx, rayOptions...)
-	snifferList := proxyman.ProtocolSniffersFromContext(ctx)
-	if destination.Address.Family().IsDomain() || len(snifferList) == 0 {
+	inbound, outbound := d.getLink(ctx)
+	sniffingConfig := proxyman.SniffingConfigFromContext(ctx)
+	if destination.Network != net.Network_TCP || sniffingConfig == nil || !sniffingConfig.Enabled {
 		go d.routedDispatch(ctx, outbound, destination)
 	} else {
 		go func() {
-			domain, err := sniffer(ctx, snifferList, outbound)
+			cReader := &cachedReader{
+				reader: outbound.Reader.(*pipe.Reader),
+			}
+			outbound.Reader = cReader
+			result, err := sniffer(ctx, cReader)
 			if err == nil {
-				newError("sniffed domain: ", domain).WithContext(ctx).WriteToLog()
+				ctx = ContextWithSniffingResult(ctx, result)
+			}
+			if err == nil && shouldOverride(result, sniffingConfig.DestinationOverride) {
+				domain := result.Domain()
+				newError("sniffed domain: ", domain).WriteToLog(session.ExportIDToError(ctx))
 				destination.Address = net.ParseAddress(domain)
-				ctx = proxy.ContextWithTarget(ctx, destination)
+				ob.Target = destination
 			}
 			d.routedDispatch(ctx, outbound, destination)
 		}()
 	}
-	return outbound, nil
+	return inbound, nil
 }
 
-func sniffer(ctx context.Context, snifferList []proxyman.KnownProtocols, outbound ray.OutboundRay) (string, error) {
+func sniffer(ctx context.Context, cReader *cachedReader) (SniffResult, error) {
 	payload := buf.New()
 	defer payload.Release()
 
-	sniffer := NewSniffer(snifferList)
+	sniffer := NewSniffer()
 	totalAttempt := 0
 	for {
 		select {
 		case <-ctx.Done():
-			return "", ctx.Err()
+			return nil, ctx.Err()
 		default:
 			totalAttempt++
-			if totalAttempt > 5 {
-				return "", errSniffingTimeout
+			if totalAttempt > 2 {
+				return nil, errSniffingTimeout
 			}
-			outbound.OutboundInput().Peek(payload)
+
+			cReader.Cache(payload)
 			if !payload.IsEmpty() {
-				domain, err := sniffer.Sniff(payload.Bytes())
-				if err != ErrMoreData {
-					return domain, err
+				result, err := sniffer.Sniff(payload.Bytes())
+				if err != common.ErrNoClue {
+					return result, err
 				}
 			}
 			if payload.IsFull() {
-				return "", ErrInvalidData
+				return nil, errUnknownContent
 			}
-			time.Sleep(time.Millisecond * 100)
 		}
 	}
 }
 
-func (d *DefaultDispatcher) routedDispatch(ctx context.Context, outbound ray.OutboundRay, destination net.Destination) {
+func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *vio.Link, destination net.Destination) {
 	dispatcher := d.ohm.GetDefaultHandler()
 	if d.router != nil {
 		if tag, err := d.router.PickRoute(ctx); err == nil {
 			if handler := d.ohm.GetHandler(tag); handler != nil {
-				newError("taking detour [", tag, "] for [", destination, "]").WithContext(ctx).WriteToLog()
+				newError("taking detour [", tag, "] for [", destination, "]").WriteToLog(session.ExportIDToError(ctx))
 				dispatcher = handler
 			} else {
-				newError("non existing tag: ", tag).AtWarning().WithContext(ctx).WriteToLog()
+				newError("non existing tag: ", tag).AtWarning().WriteToLog(session.ExportIDToError(ctx))
 			}
 		} else {
-			newError("default route for ", destination).WithContext(ctx).WriteToLog()
+			newError("default route for ", destination).WriteToLog(session.ExportIDToError(ctx))
 		}
 	}
-	dispatcher.Dispatch(ctx, outbound)
-}
-
-func init() {
-	common.Must(common.RegisterConfig((*Config)(nil), func(ctx context.Context, config interface{}) (interface{}, error) {
-		return NewDefaultDispatcher(ctx, config.(*Config))
-	}))
+	dispatcher.Dispatch(ctx, link)
 }

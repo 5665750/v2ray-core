@@ -18,6 +18,7 @@ import (
 	"v2ray.com/core/app/router"
 	"v2ray.com/core/app/stats"
 	statscmd "v2ray.com/core/app/stats/command"
+	"v2ray.com/core/common/compare"
 	"v2ray.com/core/common/net"
 	"v2ray.com/core/common/protocol"
 	"v2ray.com/core/common/serial"
@@ -101,12 +102,17 @@ func TestCommanderRemoveHandler(t *testing.T) {
 	servers, err := InitializeServerConfigs(clientConfig)
 	assert(err, IsNil)
 
+	defer CloseAllServers(servers)
+
 	{
 		conn, err := net.DialTCP("tcp", nil, &net.TCPAddr{
 			IP:   []byte{127, 0, 0, 1},
 			Port: int(clientPort),
 		})
-		assert(err, IsNil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close() // nolint: errcheck
 
 		payload := "commander request."
 		nBytes, err := conn.Write([]byte(payload))
@@ -116,8 +122,9 @@ func TestCommanderRemoveHandler(t *testing.T) {
 		response := make([]byte, 1024)
 		nBytes, err = conn.Read(response)
 		assert(err, IsNil)
-		assert(response[:nBytes], Equals, xor([]byte(payload)))
-		assert(conn.Close(), IsNil)
+		if err := compare.BytesEqualWithDetail(response[:nBytes], xor([]byte(payload))); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	cmdConn, err := grpc.Dial(fmt.Sprintf("127.0.0.1:%d", cmdPort), grpc.WithInsecure(), grpc.WithBlock())
@@ -137,8 +144,6 @@ func TestCommanderRemoveHandler(t *testing.T) {
 		})
 		assert(err, IsNotNil)
 	}
-
-	CloseAllServers(servers)
 }
 
 func TestCommanderAddRemoveUser(t *testing.T) {
@@ -395,10 +400,16 @@ func TestCommanderStats(t *testing.T) {
 						},
 					},
 				},
+				System: &policy.SystemPolicy{
+					Stats: &policy.SystemPolicy_Stats{
+						InboundUplink: true,
+					},
+				},
 			}),
 		},
 		Inbound: []*core.InboundHandlerConfig{
 			{
+				Tag: "vmess",
 				ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{
 					PortRange: net.SinglePortRange(serverPort),
 					Listen:    net.NewIPOrDomain(net.LocalHostIP),
@@ -481,13 +492,17 @@ func TestCommanderStats(t *testing.T) {
 	}
 
 	servers, err := InitializeServerConfigs(serverConfig, clientConfig)
-	assert(err, IsNil)
+	if err != nil {
+		t.Fatal("Failed to create all servers", err)
+	}
+	defer CloseAllServers(servers)
 
 	conn, err := net.DialTCP("tcp", nil, &net.TCPAddr{
 		IP:   []byte{127, 0, 0, 1},
 		Port: int(clientPort),
 	})
 	assert(err, IsNil)
+	defer conn.Close() // nolint: errcheck
 
 	payload := make([]byte, 10240*1024)
 	rand.Read(payload)
@@ -497,8 +512,9 @@ func TestCommanderStats(t *testing.T) {
 	assert(nBytes, Equals, len(payload))
 
 	response := readFrom(conn, time.Second*20, 10240*1024)
-	assert(response, Equals, xor([]byte(payload)))
-	assert(conn.Close(), IsNil)
+	if err := compare.BytesEqualWithDetail(response, xor([]byte(payload))); err != nil {
+		t.Fatal("failed to read response: ", err)
+	}
 
 	cmdConn, err := grpc.Dial(fmt.Sprintf("127.0.0.1:%d", cmdPort), grpc.WithInsecure(), grpc.WithBlock())
 	assert(err, IsNil)
@@ -521,5 +537,10 @@ func TestCommanderStats(t *testing.T) {
 	assert(sresp.Stat.Name, Equals, name)
 	assert(sresp.Stat.Value, Equals, int64(0))
 
-	CloseAllServers(servers)
+	sresp, err = sClient.GetStats(context.Background(), &statscmd.GetStatsRequest{
+		Name:   "inbound>>>vmess>>>traffic>>>uplink",
+		Reset_: true,
+	})
+	assert(err, IsNil)
+	assert(sresp.Stat.Value, GreaterThan, int64(10240*1024))
 }

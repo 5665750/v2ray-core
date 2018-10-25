@@ -24,10 +24,26 @@ message Policy {
     bool user_downlink = 2;
   }
 
+  message Buffer {
+    // Buffer size per connection, in bytes. -1 for unlimited buffer.
+    int32 connection = 1;
+  }
+
   Timeout timeout = 1;
   Stats stats = 2;
+  Buffer buffer = 3;
+}
+
+message SystemPolicy {
+  message Stats {
+    bool inbound_uplink = 1;
+    bool inbound_downlink = 2;
+  }
+
+  Stats stats = 1;
 }
 
 message Config {
   map<uint32, Policy> level = 1;
+  SystemPolicy system = 2;
 }

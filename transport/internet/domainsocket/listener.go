@@ -1,3 +1,6 @@
+// +build !windows
+// +build !wasm
+
 package domainsocket
 
 import (
@@ -125,5 +128,5 @@ func (fl *fileLocker) Release() {
 }
 
 func init() {
-	common.Must(internet.RegisterTransportListener(internet.TransportProtocol_DomainSocket, Listen))
+	common.Must(internet.RegisterTransportListener(protocolName, Listen))
 }

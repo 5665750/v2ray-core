@@ -2,7 +2,6 @@ package uuid // import "v2ray.com/core/common/uuid"
 
 import (
 	"bytes"
-	"crypto/md5"
 	"crypto/rand"
 	"encoding/hex"
 
@@ -46,21 +45,6 @@ func (u *UUID) Equals(another *UUID) bool {
 	return bytes.Equal(u.Bytes(), another.Bytes())
 }
 
-// Next generates a deterministic random UUID based on this UUID.
-func (u *UUID) Next() UUID {
-	md5hash := md5.New()
-	common.Must2(md5hash.Write(u.Bytes()))
-	common.Must2(md5hash.Write([]byte("16167dc8-16b6-4e6d-b8bb-65dd68113a81")))
-	var newid UUID
-	for {
-		md5hash.Sum(newid[:0])
-		if !newid.Equals(u) {
-			return newid
-		}
-		common.Must2(md5hash.Write([]byte("533eff8a-4113-4b10-b5ce-0f5d76b98cd2")))
-	}
-}
-
 // New creates a UUID with random value.
 func New() UUID {
 	var uuid UUID
@@ -94,9 +78,7 @@ func ParseString(str string) (UUID, error) {
 			text = text[1:]
 		}
 
-		_, err := hex.Decode(b[:byteGroup/2], text[:byteGroup])
-
-		if err != nil {
+		if _, err := hex.Decode(b[:byteGroup/2], text[:byteGroup]); err != nil {
 			return uuid, err
 		}
 

@@ -1,3 +1,6 @@
+// +build !windows
+// +build !wasm
+
 package domainsocket
 
 import (
@@ -10,11 +13,11 @@ import (
 )
 
 func getSettingsFromContext(ctx context.Context) *Config {
-	rawSettings := internet.TransportSettingsFromContext(ctx)
+	rawSettings := internet.StreamSettingsFromContext(ctx)
 	if rawSettings == nil {
 		return nil
 	}
-	return rawSettings.(*Config)
+	return rawSettings.ProtocolSettings.(*Config)
 }
 
 func Dial(ctx context.Context, dest net.Destination) (internet.Connection, error) {
@@ -41,5 +44,5 @@ func Dial(ctx context.Context, dest net.Destination) (internet.Connection, error
 }
 
 func init() {
-	common.Must(internet.RegisterTransportDialer(internet.TransportProtocol_DomainSocket, Dial))
+	common.Must(internet.RegisterTransportDialer(protocolName, Dial))
 }

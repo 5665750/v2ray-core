@@ -6,63 +6,31 @@ import (
 	"path/filepath"
 	"strconv"
 	"testing"
-	"time"
 
 	proto "github.com/golang/protobuf/proto"
+
+	"v2ray.com/core/app/dispatcher"
 	. "v2ray.com/core/app/router"
 	"v2ray.com/core/common"
 	"v2ray.com/core/common/errors"
 	"v2ray.com/core/common/net"
 	"v2ray.com/core/common/platform"
 	"v2ray.com/core/common/protocol"
-	"v2ray.com/core/proxy"
+	"v2ray.com/core/common/protocol/http"
+	"v2ray.com/core/common/session"
 	. "v2ray.com/ext/assert"
 	"v2ray.com/ext/sysio"
 )
 
-func TestSubDomainMatcher(t *testing.T) {
-	assert := With(t)
+func withOutbound(outbound *session.Outbound) context.Context {
+	return session.ContextWithOutbound(context.Background(), outbound)
+}
 
-	cases := []struct {
-		pattern string
-		input   string
-		output  bool
-	}{
-		{
-			pattern: "v2ray.com",
-			input:   "www.v2ray.com",
-			output:  true,
-		},
-		{
-			pattern: "v2ray.com",
-			input:   "v2ray.com",
-			output:  true,
-		},
-		{
-			pattern: "v2ray.com",
-			input:   "www.v3ray.com",
-			output:  false,
-		},
-		{
-			pattern: "v2ray.com",
-			input:   "2ray.com",
-			output:  false,
-		},
-		{
-			pattern: "v2ray.com",
-			input:   "xv2ray.com",
-			output:  false,
-		},
-	}
-	for _, test := range cases {
-		matcher := NewSubDomainMatcher(test.pattern)
-		assert(matcher.Apply(test.input) == test.output, IsTrue)
-	}
+func withInbound(inbound *session.Inbound) context.Context {
+	return session.ContextWithInbound(context.Background(), inbound)
 }
 
 func TestRoutingRule(t *testing.T) {
-	assert := With(t)
-
 	type ruleTest struct {
 		input  context.Context
 		output bool
@@ -91,27 +59,27 @@ func TestRoutingRule(t *testing.T) {
 			},
 			test: []ruleTest{
 				{
-					input:  proxy.ContextWithTarget(context.Background(), net.TCPDestination(net.DomainAddress("v2ray.com"), 80)),
+					input:  withOutbound(&session.Outbound{Target: net.TCPDestination(net.DomainAddress("v2ray.com"), 80)}),
 					output: true,
 				},
 				{
-					input:  proxy.ContextWithTarget(context.Background(), net.TCPDestination(net.DomainAddress("www.v2ray.com.www"), 80)),
+					input:  withOutbound(&session.Outbound{Target: net.TCPDestination(net.DomainAddress("www.v2ray.com.www"), 80)}),
 					output: true,
 				},
 				{
-					input:  proxy.ContextWithTarget(context.Background(), net.TCPDestination(net.DomainAddress("v2ray.co"), 80)),
+					input:  withOutbound(&session.Outbound{Target: net.TCPDestination(net.DomainAddress("v2ray.co"), 80)}),
 					output: false,
 				},
 				{
-					input:  proxy.ContextWithTarget(context.Background(), net.TCPDestination(net.DomainAddress("www.google.com"), 80)),
+					input:  withOutbound(&session.Outbound{Target: net.TCPDestination(net.DomainAddress("www.google.com"), 80)}),
 					output: true,
 				},
 				{
-					input:  proxy.ContextWithTarget(context.Background(), net.TCPDestination(net.DomainAddress("facebook.com"), 80)),
+					input:  withOutbound(&session.Outbound{Target: net.TCPDestination(net.DomainAddress("facebook.com"), 80)}),
 					output: true,
 				},
 				{
-					input:  proxy.ContextWithTarget(context.Background(), net.TCPDestination(net.DomainAddress("www.facebook.com"), 80)),
+					input:  withOutbound(&session.Outbound{Target: net.TCPDestination(net.DomainAddress("www.facebook.com"), 80)}),
 					output: false,
 				},
 				{
@@ -139,19 +107,39 @@ func TestRoutingRule(t *testing.T) {
 			},
 			test: []ruleTest{
 				{
-					input:  proxy.ContextWithTarget(context.Background(), net.TCPDestination(net.ParseAddress("8.8.8.8"), 80)),
+					input:  withOutbound(&session.Outbound{Target: net.TCPDestination(net.ParseAddress("8.8.8.8"), 80)}),
 					output: true,
 				},
 				{
-					input:  proxy.ContextWithTarget(context.Background(), net.TCPDestination(net.ParseAddress("8.8.4.4"), 80)),
+					input:  withOutbound(&session.Outbound{Target: net.TCPDestination(net.ParseAddress("8.8.4.4"), 80)}),
 					output: false,
 				},
 				{
-					input:  proxy.ContextWithTarget(context.Background(), net.TCPDestination(net.ParseAddress("2001:0db8:85a3:0000:0000:8a2e:0370:7334"), 80)),
+					input:  withOutbound(&session.Outbound{Target: net.TCPDestination(net.ParseAddress("2001:0db8:85a3:0000:0000:8a2e:0370:7334"), 80)}),
 					output: true,
 				},
 				{
 					input:  context.Background(),
+					output: false,
+				},
+			},
+		},
+		{
+			rule: &RoutingRule{
+				SourceCidr: []*CIDR{
+					{
+						Ip:     []byte{192, 168, 0, 0},
+						Prefix: 16,
+					},
+				},
+			},
+			test: []ruleTest{
+				{
+					input:  withInbound(&session.Inbound{Source: net.TCPDestination(net.ParseAddress("192.168.0.1"), 80)}),
+					output: true,
+				},
+				{
+					input:  withInbound(&session.Inbound{Source: net.TCPDestination(net.ParseAddress("10.0.0.1"), 80)}),
 					output: false,
 				},
 			},
@@ -164,11 +152,11 @@ func TestRoutingRule(t *testing.T) {
 			},
 			test: []ruleTest{
 				{
-					input:  protocol.ContextWithUser(context.Background(), &protocol.User{Email: "admin@v2ray.com"}),
+					input:  withInbound(&session.Inbound{User: &protocol.MemoryUser{Email: "admin@v2ray.com"}}),
 					output: true,
 				},
 				{
-					input:  protocol.ContextWithUser(context.Background(), &protocol.User{Email: "love@v2ray.com"}),
+					input:  withInbound(&session.Inbound{User: &protocol.MemoryUser{Email: "love@v2ray.com"}}),
 					output: false,
 				},
 				{
@@ -177,14 +165,43 @@ func TestRoutingRule(t *testing.T) {
 				},
 			},
 		},
+		{
+			rule: &RoutingRule{
+				Protocol: []string{"http"},
+			},
+			test: []ruleTest{
+				{
+					input:  dispatcher.ContextWithSniffingResult(context.Background(), &http.SniffHeader{}),
+					output: true,
+				},
+			},
+		},
+		{
+			rule: &RoutingRule{
+				InboundTag: []string{"test", "test1"},
+			},
+			test: []ruleTest{
+				{
+					input:  withInbound(&session.Inbound{Tag: "test"}),
+					output: true,
+				},
+				{
+					input:  withInbound(&session.Inbound{Tag: "test2"}),
+					output: false,
+				},
+			},
+		},
 	}
 
 	for _, test := range cases {
 		cond, err := test.rule.BuildCondition()
-		assert(err, IsNil)
+		common.Must(err)
 
-		for _, t := range test.test {
-			assert(cond.Apply(t.input), Equals, t.output)
+		for _, subtest := range test.test {
+			actual := cond.Apply(subtest.input)
+			if actual != subtest.output {
+				t.Error("test case failed: ", subtest.input, " expected ", subtest.output, " but got ", actual)
+			}
 		}
 	}
 }
@@ -216,10 +233,8 @@ func TestChinaSites(t *testing.T) {
 	domains, err := loadGeoSite("CN")
 	assert(err, IsNil)
 
-	matcher := NewCachableDomainMatcher()
-	for _, d := range domains {
-		assert(matcher.Add(d), IsNil)
-	}
+	matcher, err := NewDomainMatcher(domains)
+	common.Must(err)
 
 	assert(matcher.ApplyDomain("163.com"), IsTrue)
 	assert(matcher.ApplyDomain("163.com"), IsTrue)
@@ -228,9 +243,5 @@ func TestChinaSites(t *testing.T) {
 
 	for i := 0; i < 1024; i++ {
 		assert(matcher.ApplyDomain(strconv.Itoa(i)+".not-exists.com"), IsFalse)
-	}
-	time.Sleep(time.Second * 10)
-	for i := 0; i < 1024; i++ {
-		assert(matcher.ApplyDomain(strconv.Itoa(i)+".not-exists2.com"), IsFalse)
 	}
 }
